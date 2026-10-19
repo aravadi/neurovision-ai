@@ -1,0 +1,16 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary Streamlit & OS files
+.DS_Store
+Thumbs.db
+*.log
+tunnel.log
+
+# Uploaded test patient directories
+outputs/predictions/
+outputs/meshes/
+outputs/visualizations/
+data/uploads/

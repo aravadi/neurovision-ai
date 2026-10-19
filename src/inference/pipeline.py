@@ -32,7 +32,7 @@ class NeuroVisionInferencePipeline:
     """
     def __init__(
         self,
-        model_weights_path: Union[str, Path],
+        model_weights_path: Union[str, Path] = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         roi_size: Tuple[int, int, int] = (128, 128, 128),
         sw_overlap: float = 0.5,
@@ -42,6 +42,13 @@ class NeuroVisionInferencePipeline:
         self.roi_size = roi_size
         self.sw_overlap = sw_overlap
         self.min_cluster_size = min_cluster_size
+
+        # Optimize CPU threads on cloud instances
+        if self.device.type == "cpu":
+            try:
+                torch.set_num_threads(2)
+            except Exception:
+                pass
 
         # 1. Instantiate Network
         self.model = UNet(
@@ -56,34 +63,34 @@ class NeuroVisionInferencePipeline:
             bias=False,
         ).to(self.device)
 
-        # 2. Load Weights
-        weights_path = Path(model_weights_path)
-        if not weights_path.exists():
-            raise FileNotFoundError(f"Model weights not found at: {weights_path}")
+        # 2. Load Weights if provided
+        if model_weights_path is not None:
+            weights_path = Path(model_weights_path)
+            if not weights_path.exists():
+                raise FileNotFoundError(f"Model weights not found at: {weights_path}")
 
-        checkpoint = torch.load(weights_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.model.eval()
+            checkpoint = torch.load(weights_path, map_location=self.device)
+            state_dict = checkpoint.get("model_state_dict", checkpoint)
+            self.model.load_state_dict(state_dict)
+            self.model.eval()
 
-        # 3. Sliding Window Inferer
+        # 3. Sliding Window Inferer (CPU: 0.15 overlap cuts latency by ~70%)
         if self.device.type == "cpu":
-            import torch
-            torch.set_num_threads(2)
             self.inferer = SlidingWindowInferer(
-                roi_size=(128, 128, 128),
+                roi_size=self.roi_size,
                 sw_batch_size=1,
                 overlap=0.15,
                 mode="gaussian"
             )
         else:
             self.inferer = SlidingWindowInferer(
-                roi_size=(128, 128, 128),
+                roi_size=self.roi_size,
                 sw_batch_size=2,
                 overlap=0.5,
                 mode="gaussian"
-    )
+            )
 
-        # 4. Monai Preprocessing Pipeline (No labels required!)
+        # 4. Monai Preprocessing Pipeline
         self.preprocessor = Compose([
             LoadImaged(keys=["image"]),
             EnsureChannelFirstd(keys=["image"]),
@@ -131,7 +138,6 @@ class NeuroVisionInferencePipeline:
         ref_canonical = nib.as_closest_canonical(ref_img)
         ref_affine = ref_canonical.affine
         ref_header = ref_canonical.header
-        ref_shape = ref_canonical.shape
 
         # 2. Preprocess Input Volumes
         data_dict = {"image": [str(flair_path), str(t1_path), str(t1ce_path), str(t2_path)]}
@@ -142,10 +148,14 @@ class NeuroVisionInferencePipeline:
 
         # 3. Model Forward Pass
         with torch.no_grad():
-            with torch.amp.autocast('cuda' if self.device.type == 'cuda' else 'cpu'):
+            if self.device.type == "cuda":
+                with torch.amp.autocast("cuda"):
+                    logits = self.inferer(input_tensor, self.model)
+            else:
                 logits = self.inferer(input_tensor, self.model)
-                probs = torch.sigmoid(logits)[0]  # [3, D, H, W]
-                preds = (probs > 0.5).float().cpu().numpy()
+
+            probs = torch.sigmoid(logits)[0]  # [3, D, H, W]
+            preds = (probs > 0.5).float().cpu().numpy()
 
         t2 = time.time()
         timings["inference_s"] = round(t2 - t1, 3)
@@ -183,8 +193,8 @@ class NeuroVisionInferencePipeline:
             nib.save(nii_out, str(output_path))
 
         return {
-            "seg_mask": seg_mask,                     # [D, H, W] discrete labels (0, 1, 2, 4)
-            "preprocessed_image": input_tensor[0].cpu().numpy(), # [4, D, H, W]
+            "seg_mask": seg_mask,
+            "preprocessed_image": input_tensor[0].cpu().numpy(),
             "affine": ref_affine,
             "volumes_ml": {
                 "whole_tumor": round(wt_vol_ml, 2),

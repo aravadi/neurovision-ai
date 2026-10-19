@@ -66,12 +66,22 @@ class NeuroVisionInferencePipeline:
         self.model.eval()
 
         # 3. Sliding Window Inferer
-        self.inferer = SlidingWindowInferer(
-            roi_size=self.roi_size,
-            sw_batch_size=2,
-            overlap=self.sw_overlap,
-            mode="gaussian"
-        )
+        if self.device.type == "cpu":
+            import torch
+            torch.set_num_threads(2)
+            self.inferer = SlidingWindowInferer(
+                roi_size=(128, 128, 128),
+                sw_batch_size=1,
+                overlap=0.15,
+                mode="gaussian"
+            )
+        else:
+            self.inferer = SlidingWindowInferer(
+                roi_size=(128, 128, 128),
+                sw_batch_size=2,
+                overlap=0.5,
+                mode="gaussian"
+    )
 
         # 4. Monai Preprocessing Pipeline (No labels required!)
         self.preprocessor = Compose([

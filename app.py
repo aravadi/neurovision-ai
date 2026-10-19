@@ -12,10 +12,17 @@ import nibabel as nib
 import streamlit as st
 import streamlit.components.v1 as components
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
 from scipy.ndimage import gaussian_filter, binary_fill_holes, binary_closing
 from skimage.measure import marching_cubes
 import pyvista as pv
+import torch
+
+# Optimize PyTorch CPU execution for Streamlit Cloud
+if not torch.cuda.is_available():
+    try:
+        torch.set_num_threads(2)
+    except Exception:
+        pass
 
 # Append local src to path
 sys.path.append(str(Path(__file__).parent))
@@ -63,27 +70,35 @@ CHECKPOINT_PATH = Path(__file__).resolve().parent / "models" / "best_metric_mode
 def load_ai_pipeline():
     return NeuroVisionInferencePipeline(model_weights_path=CHECKPOINT_PATH)
 
-# ==============================================================================
-# SIDEBAR NAVIGATION
-# ==============================================================================
-st.sidebar.image("https://img.icons8.com/fluency/96/brain.png", width=70)
-st.sidebar.title("NeuroVision AI")
-st.sidebar.caption("3D Surgical Neuro-Navigation Prototype")
+# Fast 2D Slice Renderer (Instant NumPy + Alpha Overlay)
+def fast_slice_render(underlay_slice, mask_slice=None, show_mask=True):
+    s_min = float(np.min(underlay_slice))
+    s_max = float(np.max(underlay_slice))
+    if s_max > s_min:
+        norm = ((underlay_slice - s_min) / (s_max - s_min) * 255.0).clip(0, 255).astype(np.uint8)
+    else:
+        norm = np.zeros_like(underlay_slice, dtype=np.uint8)
 
-page = st.sidebar.radio(
-    "Navigation",
-    ["📁 1. Upload & Select Scans",
-     "🧠 2. AI Segmentation & 2D Slices",
-     "🎮 3. Interactive 3D Viewer",
-     "📊 4. Quantitative Analytics",
-     "📑 5. Surgical Report Dossier"]
-)
+    # 3-channel grayscale RGB
+    rgb = np.stack([norm, norm, norm], axis=-1)
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("**Modalities Active:**")
-st.sidebar.markdown("🟢 `FLAIR` | 🟢 `T1` | 🟢 `T1CE` | 🟢 `T2`")
-st.sidebar.markdown("**Color Key:**")
-st.sidebar.markdown("🟡 **Yellow**: Edema\n\n🔴 **Red**: Tumor Core\n\n🔵 **Blue**: Enhancing Tumor")
+    # Blend tumor segmentation labels
+    if show_mask and mask_slice is not None:
+        alpha = 0.70
+        # Label 2: Yellow (Edema)
+        m2 = (mask_slice == 2)
+        if np.any(m2):
+            rgb[m2] = (rgb[m2] * (1.0 - alpha) + np.array([250, 230, 25]) * alpha).astype(np.uint8)
+        # Label 1: Red (Necrotic Core)
+        m1 = (mask_slice == 1)
+        if np.any(m1):
+            rgb[m1] = (rgb[m1] * (1.0 - alpha) + np.array([242, 38, 38]) * alpha).astype(np.uint8)
+        # Label 4: Blue (Enhancing Tumor)
+        m4 = (mask_slice == 4)
+        if np.any(m4):
+            rgb[m4] = (rgb[m4] * (1.0 - alpha) + np.array([16, 128, 255]) * alpha).astype(np.uint8)
+
+    return rgb
 
 # Helper: Extract 3D Surface
 def extract_surface_mesh(binary_vol, affine, sigma=1.0, step=1, smooth_iter=20, decimate=0.4):
@@ -92,7 +107,7 @@ def extract_surface_mesh(binary_vol, affine, sigma=1.0, step=1, smooth_iter=20, 
     field = gaussian_filter(binary_vol.astype(np.float32), sigma=sigma)
     min_v, max_v = float(np.min(field)), float(np.max(field))
 
-    # Safe level check: guarantees isovalue is inside data range
+    # Safe level check
     if not (min_v < 0.5 < max_v):
         if max_v > 0.15:
             level = max_v * 0.5
@@ -120,13 +135,35 @@ def extract_surface_mesh(binary_vol, affine, sigma=1.0, step=1, smooth_iter=20, 
     return mesh
 
 # ==============================================================================
+# SIDEBAR NAVIGATION
+# ==============================================================================
+st.sidebar.image("https://img.icons8.com/fluency/96/brain.png", width=70)
+st.sidebar.title("NeuroVision AI")
+st.sidebar.caption("3D Surgical Neuro-Navigation Prototype")
+
+page = st.sidebar.radio(
+    "Navigation",
+    ["📁 1. Upload & Select Scans",
+     "🧠 2. AI Segmentation & 2D Slices",
+     "🎮 3. Interactive 3D Viewer",
+     "📊 4. Quantitative Analytics",
+     "📑 5. Surgical Report Dossier"]
+)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Modalities Active:**")
+st.sidebar.markdown("`FLAIR` | `T1` | `T1CE` | `T2`")
+st.sidebar.markdown("**Color Key:**")
+st.sidebar.markdown("**Yellow**: Edema\n\n**Red**: Tumor Core\n\n**Blue**: Enhancing Tumor")
+
+# ==============================================================================
 # PAGE 1: UPLOAD & SELECT SCANS
 # ==============================================================================
 if page == "📁 1. Upload & Select Scans":
-    st.title("📁 Patient MRI Ingestion")
-    st.write("Upload 4 co-registered NIfTI (`.nii`) MRI sequences or select a pre-loaded clinical case.")
+    st.title("Patient MRI Ingestion")
+    st.write("Upload 4 co-registered NIfTI (.nii) MRI sequences or select a pre-loaded clinical case.")
 
-    tab_demo, tab_upload = st.tabs(["🎯 Quick Demo Patients", "📤 Upload Custom .nii Scans"])
+    tab_demo, tab_upload = st.tabs(["Quick Demo Patients", "Upload Custom .nii Scans"])
 
     with tab_demo:
         available_cases = sorted([p.name for p in DATA_DIR.rglob("BraTS20_Training_*") if p.is_dir()])
@@ -136,16 +173,16 @@ if page == "📁 1. Upload & Select Scans":
 
         col1, col2 = st.columns([1, 2])
         with col1:
-            if st.button("🚀 Load Patient Scans"):
+            if st.button("Load Patient Scans"):
                 case_dir = list(DATA_DIR.rglob(selected_case))[0]
                 st.session_state["selected_dir"] = case_dir
                 st.session_state["case_name"] = selected_case
-                st.success(f"Loaded {selected_case} successfully! Proceed to Page 2.")
+                st.success(f"Loaded {selected_case} successfully. Proceed to Page 2.")
 
         with col2:
             st.info("""
             **Recommended Cases:**
-            - `BraTS20_Training_047`: Large Glioblastoma with prominent **Red Core (30.2 mL)**, **Yellow Edema (70.4 mL)**, and **Blue Enhancing (32.0 mL)**.
+            - `BraTS20_Training_047`: Large Glioblastoma with prominent Red Core (30.2 mL), Yellow Edema (70.4 mL), and Blue Enhancing (32.0 mL).
             - `BraTS20_Training_001`: Classic frontal convexity glioma.
             """)
 
@@ -162,18 +199,16 @@ if page == "📁 1. Upload & Select Scans":
         patient_name_input = st.text_input("Patient Identifier:", value="Custom_Patient_001")
 
         if u_flair and u_t1 and u_t1ce and u_t2:
-            if st.button("💾 Ingest & Process Uploaded Scans"):
+            if st.button("Ingest & Process Uploaded Scans"):
                 with st.spinner("Saving NIfTI scans to disk and verifying geometry..."):
                     upload_dir = Path(f"data/uploads/{patient_name_input}")
                     upload_dir.mkdir(parents=True, exist_ok=True)
 
-                    # Save to disk with canonical modality names
                     with open(upload_dir / f"{patient_name_input}_flair.nii", "wb") as f: f.write(u_flair.getbuffer())
                     with open(upload_dir / f"{patient_name_input}_t1.nii", "wb") as f: f.write(u_t1.getbuffer())
                     with open(upload_dir / f"{patient_name_input}_t1ce.nii", "wb") as f: f.write(u_t1ce.getbuffer())
                     with open(upload_dir / f"{patient_name_input}_t2.nii", "wb") as f: f.write(u_t2.getbuffer())
 
-                    # Update session state and reset previous prediction cache
                     st.session_state["selected_dir"] = upload_dir
                     st.session_state["case_name"] = patient_name_input
                     st.session_state["pipeline_results"] = None
@@ -181,16 +216,16 @@ if page == "📁 1. Upload & Select Scans":
                     st.session_state["obj_strings"] = None
                     st.session_state["analytics"] = None
 
-                    st.success(f"✅ All 4 sequences for '{patient_name_input}' saved! Now click '🧠 2. AI Segmentation' in the sidebar.")
+                    st.success(f"All 4 sequences for '{patient_name_input}' saved. Now click '2. AI Segmentation' in the sidebar.")
 
 # ==============================================================================
 # PAGE 2: AI SEGMENTATION & 2D SLICER
 # ==============================================================================
 elif page == "🧠 2. AI Segmentation & 2D Slices":
-    st.title("🧠 AI Segmentation & Orthogonal Slicer")
+    st.title("AI Segmentation & Orthogonal Slicer")
 
     if st.session_state.get("case_name") is None:
-        st.warning("⚠️ Please select or upload a patient on Page 1 first!")
+        st.warning("Please select or upload a patient on Page 1 first.")
         st.stop()
 
     case_name = st.session_state["case_name"]
@@ -198,8 +233,8 @@ elif page == "🧠 2. AI Segmentation & 2D Slices":
 
     # Trigger Inference Button
     if st.session_state["pipeline_results"] is None or st.session_state["case_name"] != case_name:
-        if st.button(f"⚡ Execute 3D UNet Segmentation for {case_name}"):
-            with st.spinner("Initializing MONAI 3D Residual UNet and sliding window inference..."):
+        if st.button(f"Execute 3D UNet Segmentation for {case_name}"):
+            with st.spinner("Running 3D sliding window inference..."):
                 pipeline = load_ai_pipeline()
                 flair = list(case_dir.glob("*flair.nii*"))[0]
                 t1 = list(case_dir.glob("*t1.nii*"))[0]
@@ -212,23 +247,15 @@ elif page == "🧠 2. AI Segmentation & 2D Slices":
 
                 st.session_state["pipeline_results"] = results
                 st.session_state["inference_time"] = elapsed
-                st.success(f"Inference completed in {elapsed:.2f} seconds!")
+                st.success(f"Inference completed in {elapsed:.2f} seconds.")
                 st.rerun()
 
-    # If results exist, display interactive 2D slicer
+    # Fast Interactive 2D Slicer
     if st.session_state["pipeline_results"] is not None:
         results = st.session_state["pipeline_results"]
         seg_mask = results["seg_mask"]
         t1ce_prep = results["preprocessed_image"][2]
         flair_prep = results["preprocessed_image"][0]
-
-        tumor_cmap = ListedColormap([
-            (0.0, 0.0, 0.0, 0.0),      # 0: Background
-            (0.95, 0.15, 0.15, 0.85),   # 1: Red (Necrotic Core)
-            (0.98, 0.90, 0.10, 0.75),   # 2: Yellow (Edema)
-            (0.0, 0.0, 0.0, 0.0),      # 3: Unused
-            (0.05, 0.45, 0.95, 0.90)    # 4: Blue (Enhancing)
-        ])
 
         st.subheader("Orthogonal Multi-Planar Slicer")
         c1, c2, c3 = st.columns([1, 1, 1])
@@ -238,7 +265,7 @@ elif page == "🧠 2. AI Segmentation & 2D Slices":
         with c2:
             show_tumor_mask = st.checkbox("Overlay AI Tumor Segmentation", value=True)
         with c3:
-            st.metric("Total Pipeline Latency", f"{st.session_state.get('inference_time', 2.1):.2f}s")
+            st.metric("Pipeline Latency", f"{st.session_state.get('inference_time', 2.1):.2f}s")
 
         # Slider coordinates
         d_z, d_y, d_x = seg_mask.shape
@@ -255,41 +282,32 @@ elif page == "🧠 2. AI Segmentation & 2D Slices":
         with col_x:
             slice_x = st.slider("Sagittal Cut (X):", 0, d_x - 1, default_x)
 
-        # Plot Orthogonal Slices
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6), facecolor="#0e1118")
+        # Fast Instant Slice Rendering (Direct NumPy to st.image, no Matplotlib lag)
+        col_img1, col_img2, col_img3 = st.columns(3)
 
-        # Axial (Horizontal)
-        axes[0].imshow(np.rot90(underlay[slice_z, :, :]), cmap="gray")
-        if show_tumor_mask:
-            axes[0].imshow(np.rot90(seg_mask[slice_z, :, :]), cmap=tumor_cmap, vmin=0, vmax=4, interpolation="nearest")
-        axes[0].set_title(f"Axial Plane (Z = {slice_z})", color="#00e5ff", fontsize=13)
-        axes[0].axis("off")
+        with col_img1:
+            st.markdown(f"<p style='color:#00e5ff; font-weight:bold; margin-bottom:4px;'>Axial Plane (Z = {slice_z})</p>", unsafe_allow_html=True)
+            img_axial = np.rot90(fast_slice_render(underlay[slice_z, :, :], seg_mask[slice_z, :, :], show_tumor_mask))
+            st.image(img_axial, use_container_width=True)
 
-        # Coronal (Frontal)
-        axes[1].imshow(np.rot90(underlay[:, slice_y, :]), cmap="gray")
-        if show_tumor_mask:
-            axes[1].imshow(np.rot90(seg_mask[:, slice_y, :]), cmap=tumor_cmap, vmin=0, vmax=4, interpolation="nearest")
-        axes[1].set_title(f"Coronal Plane (Y = {slice_y})", color="#00e5ff", fontsize=13)
-        axes[1].axis("off")
+        with col_img2:
+            st.markdown(f"<p style='color:#00e5ff; font-weight:bold; margin-bottom:4px;'>Coronal Plane (Y = {slice_y})</p>", unsafe_allow_html=True)
+            img_coronal = np.rot90(fast_slice_render(underlay[:, slice_y, :], seg_mask[:, slice_y, :], show_tumor_mask))
+            st.image(img_coronal, use_container_width=True)
 
-        # Sagittal (Lateral)
-        axes[2].imshow(np.rot90(underlay[:, :, slice_x]), cmap="gray")
-        if show_tumor_mask:
-            axes[2].imshow(np.rot90(seg_mask[:, :, slice_x]), cmap=tumor_cmap, vmin=0, vmax=4, interpolation="nearest")
-        axes[2].set_title(f"Sagittal Plane (X = {slice_x})", color="#00e5ff", fontsize=13)
-        axes[2].axis("off")
-
-        plt.tight_layout()
-        st.pyplot(fig)
+        with col_img3:
+            st.markdown(f"<p style='color:#00e5ff; font-weight:bold; margin-bottom:4px;'>Sagittal Plane (X = {slice_x})</p>", unsafe_allow_html=True)
+            img_sagittal = np.rot90(fast_slice_render(underlay[:, :, slice_x], seg_mask[:, :, slice_x], show_tumor_mask))
+            st.image(img_sagittal, use_container_width=True)
 
 # ==============================================================================
 # PAGE 3: INTERACTIVE 3D VIEWER
 # ==============================================================================
 elif page == "🎮 3. Interactive 3D Viewer":
-    st.title("🎮 Interactive 3D Neuro-Navigation")
+    st.title("Interactive 3D Neuro-Navigation")
 
     if st.session_state["pipeline_results"] is None:
-        st.warning("⚠️ Please execute AI Segmentation on Page 2 first!")
+        st.warning("Please execute AI Segmentation on Page 2 first.")
         st.stop()
 
     results = st.session_state["pipeline_results"]
@@ -314,10 +332,13 @@ elif page == "🎮 3. Interactive 3D Viewer":
             st.session_state["meshes"] = meshes
 
             # Convert to OBJ strings
+            mesh_out_dir = Path("outputs/meshes")
+            mesh_out_dir.mkdir(parents=True, exist_ok=True)
+
             obj_strings = {}
             for k, m in meshes.items():
                 if m is not None and m.n_points > 0:
-                    tmp_p = Path(f"outputs/meshes/{case_name}_{k}.obj")
+                    tmp_p = mesh_out_dir / f"{case_name}_{k}.obj"
                     m.save(str(tmp_p))
                     with open(tmp_p, "r", encoding="utf-8") as f:
                         obj_strings[k] = f.read()
@@ -327,7 +348,7 @@ elif page == "🎮 3. Interactive 3D Viewer":
 
     obj_strings = st.session_state["obj_strings"]
 
-    # Build Three.js WebGL HTML with Collapsible HUD
+    # Three.js WebGL HTML with Collapsible HUD
     html_3d = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -371,12 +392,12 @@ elif page == "🎮 3. Interactive 3D Viewer":
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/OBJLoader.js"></script>
 </head>
 <body>
-    <button id="btn-show-hud" onclick="toggleHud(true)">⚙️ Show Controls</button>
+    <button id="btn-show-hud" onclick="toggleHud(true)">Controls</button>
 
     <div id="hud">
         <div class="hud-header">
-            <h3>🧠 {case_name}</h3>
-            <button class="btn-hide" onclick="toggleHud(false)">➖ Hide</button>
+            <h3>{case_name}</h3>
+            <button class="btn-hide" onclick="toggleHud(false)">Hide</button>
         </div>
         <div class="row"><span><span class="badge" style="background:#555;">BRAIN</span> Anatomy</span><input type="checkbox" id="c-b" checked></div>
         <div class="ctrl"><label><span>Brain Opacity</span><span id="v-b">15%</span></label><input type="range" id="s-b" min="0" max="1" step="0.02" value="0.15"></div>
@@ -469,16 +490,16 @@ elif page == "🎮 3. Interactive 3D Viewer":
 </html>
 """
     components.html(html_3d, height=720, scrolling=False)
-    st.info("💡 **Navigation Tips:** Left-Click + Drag: Rotate 360° | Scroll Wheel: Zoom | Click '➖ Hide' in the HUD to collapse controls.")
+    st.info("Navigation Tips: Left-Click + Drag: Rotate 360 | Scroll Wheel: Zoom | Click 'Hide' in the HUD to collapse controls.")
 
 # ==============================================================================
 # PAGE 4: QUANTITATIVE ANALYTICS
 # ==============================================================================
 elif page == "📊 4. Quantitative Analytics":
-    st.title("📊 Clinical Morphometrics & Analytics")
+    st.title("Clinical Morphometrics & Analytics")
 
     if st.session_state["pipeline_results"] is None:
-        st.warning("⚠️ Please execute AI Segmentation on Page 2 first!")
+        st.warning("Please execute AI Segmentation on Page 2 first.")
         st.stop()
 
     case_name = st.session_state["case_name"]
@@ -536,6 +557,7 @@ elif page == "📊 4. Quantitative Analytics":
             h = b.get_height()
             ax.text(b.get_x() + b.get_width()/2., h + 1, f"{h:.1f}", ha='center', color="white", weight="bold")
         st.pyplot(fig)
+        plt.close(fig)  # Prevent Matplotlib memory buildup
 
     with c_right:
         st.subheader("Neurosurgical Stereotactic Localization")
@@ -557,10 +579,10 @@ elif page == "📊 4. Quantitative Analytics":
 # PAGE 5: SURGICAL REPORT DOSSIER
 # ==============================================================================
 elif page == "📑 5. Surgical Report Dossier":
-    st.title("📑 Surgical Neuro-Navigation Report")
+    st.title("Surgical Neuro-Navigation Report")
 
     if st.session_state["pipeline_results"] is None or st.session_state["analytics"] is None:
-        st.warning("⚠️ Please complete AI Segmentation and Analytics first!")
+        st.warning("Please complete AI Segmentation and Analytics first.")
         st.stop()
 
     case_name = st.session_state["case_name"]
@@ -602,9 +624,8 @@ elif page == "📑 5. Surgical Report Dossier":
     st.markdown(report_md)
     st.markdown("---")
 
-    # Download Buttons
     st.download_button(
-        label="📥 Download Clinical Report (Markdown)",
+        label="Download Clinical Report (Markdown)",
         data=report_md,
         file_name=f"{case_name}_Surgical_Report.md",
         mime="text/markdown"

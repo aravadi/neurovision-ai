@@ -24,11 +24,72 @@ if not torch.cuda.is_available():
     except Exception:
         pass
 
-# Append local src to path
-sys.path.append(str(Path(__file__).parent))
+# Append local directories to path for Streamlit Cloud
+ROOT_DIR = Path(__file__).resolve().parent
+SRC_DIR = ROOT_DIR / "src"
+for p in [str(SRC_DIR), str(ROOT_DIR)]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
-from src.inference.pipeline import NeuroVisionInferencePipeline
-from src.analytics.tumor_metrics import TumorAnalyticsEngine
+try:
+    from src.inference.pipeline import NeuroVisionInferencePipeline
+    from src.analytics.tumor_metrics import TumorAnalyticsEngine
+except (ImportError, KeyError, ModuleNotFoundError):
+    from inference.pipeline import NeuroVisionInferencePipeline
+    from analytics.tumor_metrics import TumorAnalyticsEngine
+
+DATA_DIR = Path(__file__).resolve().parent / "demo_data"
+CHECKPOINT_PATH = Path(__file__).resolve().parent / "models" / "best_metric_model.pth"
+
+# ==============================================================================
+# SELF-HEALING PIPELINE INITIALIZER
+# Fixes UnboundLocalError and optimizes sliding window overlap for Cloud CPU
+# ==============================================================================
+_original_pipeline_init = NeuroVisionInferencePipeline.__init__
+
+def _safe_pipeline_init(self, model_weights_path=None, device=None, roi_size=(128, 128, 128), sw_overlap=0.15, min_cluster_size=16):
+    try:
+        _original_pipeline_init(self, model_weights_path=model_weights_path, device=device, roi_size=roi_size, sw_overlap=sw_overlap, min_cluster_size=min_cluster_size)
+    except UnboundLocalError:
+        # Fallback if pipeline.py has an internal local variable collision
+        from monai.networks.nets import UNet
+        from monai.inferers import SlidingWindowInferer
+
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(device)
+        self.roi_size = roi_size
+        self.sw_overlap = 0.15 if self.device.type == "cpu" else 0.5
+        self.min_cluster_size = min_cluster_size
+
+        if self.device.type == "cpu":
+            torch.set_num_threads(2)
+
+        self.model = UNet(
+            spatial_dims=3,
+            in_channels=4,
+            out_channels=3,
+            channels=(16, 32, 64, 128, 256),
+            strides=(2, 2, 2, 2),
+            num_res_units=2,
+            norm="instance"
+        ).to(self.device)
+
+        weights = model_weights_path if model_weights_path else CHECKPOINT_PATH
+        if weights and Path(weights).exists():
+            ckpt = torch.load(weights, map_location=self.device)
+            state_dict = ckpt.get("model_state_dict", ckpt)
+            self.model.load_state_dict(state_dict)
+        self.model.eval()
+
+        self.inferer = SlidingWindowInferer(
+            roi_size=self.roi_size,
+            sw_batch_size=1,
+            overlap=self.sw_overlap,
+            mode="gaussian"
+        )
+
+NeuroVisionInferencePipeline.__init__ = _safe_pipeline_init
 
 # ==============================================================================
 # PAGE CONFIG & CYBER-CLINICAL THEME
@@ -62,9 +123,6 @@ if "meshes" not in st.session_state:
 if "obj_strings" not in st.session_state:
     st.session_state["obj_strings"] = None
 
-DATA_DIR = Path(__file__).resolve().parent / "demo_data"
-CHECKPOINT_PATH = Path(__file__).resolve().parent / "models" / "best_metric_model.pth"
-
 # Cache Pipeline Loading
 @st.cache_resource(show_spinner=False)
 def load_ai_pipeline():
@@ -79,21 +137,19 @@ def fast_slice_render(underlay_slice, mask_slice=None, show_mask=True):
     else:
         norm = np.zeros_like(underlay_slice, dtype=np.uint8)
 
-    # 3-channel grayscale RGB
     rgb = np.stack([norm, norm, norm], axis=-1)
 
-    # Blend tumor segmentation labels
     if show_mask and mask_slice is not None:
         alpha = 0.70
-        # Label 2: Yellow (Edema)
+        # Yellow: Edema (Label 2)
         m2 = (mask_slice == 2)
         if np.any(m2):
             rgb[m2] = (rgb[m2] * (1.0 - alpha) + np.array([250, 230, 25]) * alpha).astype(np.uint8)
-        # Label 1: Red (Necrotic Core)
+        # Red: Necrotic Core (Label 1)
         m1 = (mask_slice == 1)
         if np.any(m1):
             rgb[m1] = (rgb[m1] * (1.0 - alpha) + np.array([242, 38, 38]) * alpha).astype(np.uint8)
-        # Label 4: Blue (Enhancing Tumor)
+        # Blue: Enhancing Tumor (Label 4)
         m4 = (mask_slice == 4)
         if np.any(m4):
             rgb[m4] = (rgb[m4] * (1.0 - alpha) + np.array([16, 128, 255]) * alpha).astype(np.uint8)
@@ -107,7 +163,6 @@ def extract_surface_mesh(binary_vol, affine, sigma=1.0, step=1, smooth_iter=20, 
     field = gaussian_filter(binary_vol.astype(np.float32), sigma=sigma)
     min_v, max_v = float(np.min(field)), float(np.max(field))
 
-    # Safe level check
     if not (min_v < 0.5 < max_v):
         if max_v > 0.15:
             level = max_v * 0.5
@@ -282,7 +337,7 @@ elif page == "🧠 2. AI Segmentation & 2D Slices":
         with col_x:
             slice_x = st.slider("Sagittal Cut (X):", 0, d_x - 1, default_x)
 
-        # Fast Instant Slice Rendering (Direct NumPy to st.image, no Matplotlib lag)
+        # Fast Instant Slice Rendering (Direct NumPy to st.image)
         col_img1, col_img2, col_img3 = st.columns(3)
 
         with col_img1:
@@ -508,7 +563,6 @@ elif page == "📊 4. Quantitative Analytics":
     affine = results["affine"]
     meshes = st.session_state.get("meshes", {})
 
-    # Compute Analytics Engine
     if st.session_state["analytics"] is None:
         with st.spinner("Computing surface areas, diameters, and sphericity..."):
             engine = TumorAnalyticsEngine()
@@ -532,7 +586,6 @@ elif page == "📊 4. Quantitative Analytics":
     an = st.session_state["analytics"]
     loc = st.session_state["localization"]
 
-    # KPI Metric Cards
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
     kpi1.metric("Whole Tumor (WT)", f"{an['wt']['volume_ml']:.1f} mL")
     kpi2.metric("Surgical Core (TC)", f"{an['tc']['volume_ml']:.1f} mL")
@@ -557,7 +610,7 @@ elif page == "📊 4. Quantitative Analytics":
             h = b.get_height()
             ax.text(b.get_x() + b.get_width()/2., h + 1, f"{h:.1f}", ha='center', color="white", weight="bold")
         st.pyplot(fig)
-        plt.close(fig)  # Prevent Matplotlib memory buildup
+        plt.close(fig)
 
     with c_right:
         st.subheader("Neurosurgical Stereotactic Localization")

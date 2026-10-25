@@ -1,5 +1,5 @@
 """
-app.py - NeuroVision AI: 3D Brain Tumor Visualization and Neuro-Navigation Prototype
+app.py main - NeuroVision AI: 3D Brain Tumor Visualization and Neuro-Navigation Prototype
 """
 
 import os

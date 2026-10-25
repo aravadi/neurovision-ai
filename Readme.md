@@ -1,3 +1,5 @@
+Future Scope: VR in brain tumor surgery. Doctor can wear VR Glasses and do realtime surgery with live tracking with proper coordinate 
+
 NeuroVision AI: 3D Brain Tumor Visualization and Neuro-Navigation
 
 When a neurosurgeon prepares to resect a brain tumor, they typically have to scroll through hundreds of flat, 2D black-and-white MRI slices across different sequences (T1, T1CE, T2, and FLAIR). Mentally reconstructing the true 3D shape, depth, and spatial orientation of the tumor while planning an operation is difficult, time-consuming, and leaves room for ambiguity.

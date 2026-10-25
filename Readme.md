@@ -1,4 +1,4 @@
-Future Scope: VR in brain tumor surgery. Doctor can wear VR Glasses and do realtime surgery with live tracking with proper coordinate 
+Future Scope: VR in brain tumor surgery. Doctor can wear VR Glasses and do realtime surgery with live tracking with proper coordinate. 
 
 NeuroVision AI: 3D Brain Tumor Visualization and Neuro-Navigation
 

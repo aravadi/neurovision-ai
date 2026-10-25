@@ -1,5 +1,5 @@
 """
-mesh_generator.py - Extracts, smooths, transforms, and exports 3D medical meshes.
+mesh_generator.py - Extracts, smooths, transforms, and exports 3D medical meshes......
 """
 
 from pathlib import Path
